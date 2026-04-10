@@ -104,34 +104,18 @@ def render():
 
         for i, pp in enumerate(photo_paths):
             cp = os.path.join(clips_dir, f'c{i:03d}.mp4')
-            frames = max(int(sec_per_photo * 25), 1)
             cmd = [
                 'ffmpeg', '-y', '-loop', '1', '-i', pp,
-                '-vf', (
-                    f'scale=1080:1920:force_original_aspect_ratio=increase,'
-                    f'crop=1080:1920,'
-                    f'zoompan=z=\'zoom+0.0008\':x=\'iw/2-(iw/zoom/2)\':'
-                    f'y=\'ih/2-(ih/zoom/2)\':d={frames}:s=1080x1920:fps=25'
-                ),
-                '-t', str(sec_per_photo),
-                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-                '-pix_fmt', 'yuv420p', cp
+                '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
+                '-t', str(sec_per_photo), '-r', '25',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+                '-pix_fmt', 'yuv420p', '-tune', 'stillimage', cp
             ]
             r = subprocess.run(cmd, capture_output=True, text=True)
-            if r.returncode != 0:
-                # 단순 버전
-                cmd2 = [
-                    'ffmpeg', '-y', '-loop', '1', '-i', pp,
-                    '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-                    '-t', str(sec_per_photo), '-r', '25',
-                    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-                    '-pix_fmt', 'yuv420p', cp
-                ]
-                r2 = subprocess.run(cmd2, capture_output=True, text=True)
-                if r2.returncode != 0:
-                    print(f"[WARN] 클립{i} 실패")
-                    continue
-            clip_paths.append(cp)
+            if r.returncode == 0:
+                clip_paths.append(cp)
+            else:
+                print(f"[WARN] 클립{i} 실패: {r.stderr[-100:]}")
 
         if not clip_paths:
             return jsonify({'success': False, 'error': '클립 생성 실패'}), 500
@@ -208,6 +192,60 @@ def render():
         return send_file(output, mimetype='video/mp4', as_attachment=True,
                          download_name=f'{project_name}_쇼츠.mp4')
 
+    except Exception as e:
+        print(f"[ERROR] {traceback.format_exc()}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        import threading
+        def cleanup():
+            import time; time.sleep(300)
+            shutil.rmtree(job_dir, ignore_errors=True)
+        threading.Thread(target=cleanup, daemon=True).start()
+
+
+@app.route('/convert', methods=['POST'])
+def convert():
+    """WebM + MP3 → MP4 변환"""
+    job_id = str(uuid.uuid4())[:8]
+    job_dir = os.path.join(WORK_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    try:
+        project_name = request.form.get('project_name', '분양').strip()
+        video_file = request.files.get('video')
+        audio_file = request.files.get('audio')
+        if not video_file: return jsonify({'success': False, 'error': '영상 파일 없음'}), 400
+        if not audio_file: return jsonify({'success': False, 'error': '음성 파일 없음'}), 400
+
+        webm_path = os.path.join(job_dir, 'input.webm')
+        audio_path = os.path.join(job_dir, 'audio.mp3')
+        output_path = os.path.join(job_dir, f'{project_name}_쇼츠.mp4')
+        video_file.save(webm_path)
+        audio_file.save(audio_path)
+
+        print(f"[INFO] convert job={job_id} webm={os.path.getsize(webm_path)/1024:.0f}KB")
+
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', webm_path, '-i', audio_path,
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-shortest', '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart', output_path
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"[WARN] 오디오 합성 실패, 비디오만 변환: {r.stderr[-200:]}")
+            cmd2 = ['ffmpeg', '-y', '-i', webm_path,
+                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+                    '-pix_fmt', 'yuv420p', '-movflags', '+faststart', output_path]
+            r2 = subprocess.run(cmd2, capture_output=True, text=True)
+            if r2.returncode != 0:
+                return jsonify({'success': False, 'error': r2.stderr[-200:]}), 500
+
+        out_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+        print(f"[INFO] 완료 {out_size/1024/1024:.1f}MB")
+        return send_file(output_path, mimetype='video/mp4', as_attachment=True,
+                        download_name=f'{project_name}_쇼츠.mp4')
     except Exception as e:
         print(f"[ERROR] {traceback.format_exc()}")
         return jsonify({'success': False, 'error': str(e)}), 500
