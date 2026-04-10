@@ -1,210 +1,222 @@
 """
 분양쇼츠 Flask API - Railway 배포용
-- 사진 업로드 + 설정 → MP4 생성 → 다운로드
+사진 + 대본 + 음성(mp3) → ffmpeg로 MP4 생성
+대본/TTS는 브라우저에서 처리 후 넘겨줌
 """
-import os
-import sys
-import json
-import uuid
-import shutil
-import tempfile
-import traceback
+import os, sys, json, uuid, shutil, subprocess, traceback
 from flask import Flask, request, jsonify, send_file
-import httpx as _httpx
-
-# openai proxies 오류 패치
-try:
-    import openai._base_client as _obc
-    _orig_init = _obc.SyncAPIClient.__init__
-    def _patched_init(self, *args, **kwargs):
-        kwargs.pop('proxies', None)
-        _orig_init(self, *args, **kwargs)
-    _obc.SyncAPIClient.__init__ = _patched_init
-except Exception:
-    pass
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
-
-# 임시 작업 폴더
 WORK_DIR = '/tmp/shorts_work'
 os.makedirs(WORK_DIR, exist_ok=True)
 
-# ── API 키 ──
-OPENAI_KEY = os.environ.get('OPENAI_API_KEY', '').strip()
-GOOGLE_TTS_KEY = os.environ.get('GOOGLE_TTS_KEY', '').strip()
-print(f"[INFO] OpenAI Key 길이: {len(OPENAI_KEY)}, 앞4자: {OPENAI_KEY[:4] if OPENAI_KEY else 'EMPTY'}")
-
-def get_video_generator():
-    """VideoGenerator 인스턴스 생성"""
-    sys.path.insert(0, os.path.dirname(__file__))
-    from video_generator import VideoGenerator
-    config = {
-        'openai_api_key': OPENAI_KEY,
-        'google_credentials': None,
-    }
-    vg = VideoGenerator(config=config)
-    # 환경변수 키 강제 주입
-    vg.openai_key = OPENAI_KEY
+def find_font():
+    candidates = [
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc',
+        '/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc',
+        '/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc',
+        '/usr/share/fonts/opentype/noto/NotoSansCJKkr-Bold.otf',
+    ]
+    for f in candidates:
+        if os.path.exists(f):
+            return f
+    # 검색
     try:
-        import openai
-        vg.client = openai.OpenAI(api_key=OPENAI_KEY)
-    except Exception as e:
-        print(f"[WARN] OpenAI client 재설정 실패: {e}")
-    return vg
+        r = subprocess.run(['find', '/usr/share/fonts', '-name', '*Noto*Bold*', '-type', 'f'],
+                           capture_output=True, text=True)
+        lines = r.stdout.strip().split('\n')
+        for l in lines:
+            if l.strip():
+                return l.strip()
+    except:
+        pass
+    return None
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'message': '분양쇼츠 API 정상 작동 중'})
+    try:
+        r = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
+        ffmpeg_ok = 'ffmpeg version' in r.stdout
+    except:
+        ffmpeg_ok = False
+    font = find_font()
+    return jsonify({'status': 'ok', 'ffmpeg': ffmpeg_ok, 'font': font})
 
-@app.route('/generate', methods=['POST'])
-def generate():
-    """
-    영상 생성 API
-    Form data:
-        - photos[]: 사진 파일들
-        - project_name: 단지명
-        - seeds: 대사 소재 (줄바꿈으로 구분)
-        - inq_title: 문의 타이틀
-        - inq_time: 상담 시간
-        - inq_phone: 전화번호
-        - inq_position: 박스 위치 (0~50)
-        - tts_speed: TTS 속도 (1.0~1.6)
-        - tts_voice: TTS 목소리
-    """
+@app.route('/render', methods=['POST'])
+def render():
     job_id = str(uuid.uuid4())[:8]
     job_dir = os.path.join(WORK_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
     try:
-        # ── 파라미터 수집 ──
-        project_name = request.form.get('project_name', '').strip()
-        seeds = request.form.get('seeds', '').strip()
-        inq_title = request.form.get('inq_title', '분양상담센터')
-        inq_time = request.form.get('inq_time', '평일 9시~6시')
-        inq_phone = request.form.get('inq_phone', '1844-1148')
-        inq_pos = int(request.form.get('inq_position', 5))
-        tts_speed = float(request.form.get('tts_speed', 1.2))
-        tts_voice = request.form.get('tts_voice', 'ko-KR-Wavenet-B')
+        project_name = request.form.get('project_name', '분양').strip()
+        script       = request.form.get('script', '').strip()
+        inq_title    = request.form.get('inq_title', '분양상담센터')
+        inq_time     = request.form.get('inq_time', '평일 9시~6시')
+        inq_phone    = request.form.get('inq_phone', '1844-1148')
+        inq_pos      = int(request.form.get('inq_position', 5))
+        sub_size     = int(request.form.get('sub_size', 52))
+        inq_size1    = int(request.form.get('inq_size1', 90))
+        inq_size2    = int(request.form.get('inq_size2', 70))
 
-        if not project_name:
-            return jsonify({'success': False, 'error': '단지명이 없습니다'}), 400
+        # 음성 저장
+        audio_file = request.files.get('audio')
+        if not audio_file:
+            return jsonify({'success': False, 'error': '음성 파일 없음'}), 400
+        audio_path = os.path.join(job_dir, 'audio.mp3')
+        audio_file.save(audio_path)
 
-        # ── 사진 저장 ──
+        # 사진 저장
         photos = request.files.getlist('photos[]')
-        if not photos or len(photos) < 1:
-            return jsonify({'success': False, 'error': '사진이 없습니다'}), 400
-
+        if not photos:
+            return jsonify({'success': False, 'error': '사진 없음'}), 400
         photo_dir = os.path.join(job_dir, 'photos')
         os.makedirs(photo_dir, exist_ok=True)
-        for i, photo in enumerate(photos):
-            ext = os.path.splitext(photo.filename)[1] or '.jpg'
-            photo.save(os.path.join(photo_dir, f'photo_{i:03d}{ext}'))
+        photo_paths = []
+        for i, p in enumerate(photos[:20]):
+            ext = os.path.splitext(p.filename)[1].lower() or '.jpg'
+            if ext not in ['.jpg','.jpeg','.png','.webp']: ext = '.jpg'
+            path = os.path.join(photo_dir, f'p{i:03d}{ext}')
+            p.save(path)
+            photo_paths.append(path)
 
-        # ── Channel 객체 생성 ──
-        class SimpleChannel:
-            pass
+        # 음성 길이
+        probe = subprocess.run(['ffprobe','-v','quiet','-print_format','json','-show_format', audio_path],
+                               capture_output=True, text=True)
+        duration = 25.0
+        try:
+            duration = float(json.loads(probe.stdout)['format']['duration'])
+        except: pass
 
-        ch = SimpleChannel()
-        ch.channel_id = job_id
-        ch.project_name = project_name
-        ch.name = project_name
-        ch.photo_folder = photo_dir
-        ch.video_folder = ''
-        ch.pdf_folder = ''
-        ch.selected_modes = ['photos']
-        ch.inquiry_1 = inq_title
-        ch.inquiry_2 = inq_time
-        ch.inquiry_3 = inq_phone
-        ch.inquiry_4 = ''
-        ch.inquiry_font_size = 90
-        ch.inquiry_size_1 = 90
-        ch.inquiry_size_2 = 70
-        ch.inquiry_size_3 = 70
-        ch.inquiry_size_4 = 70
-        ch.inquiry_position = inq_pos
-        ch.inquiry_no_bg = False
-        ch.inquiry_bold = True
-        ch.opening_enabled = False
-        ch.opening_line1 = ''
-        ch.opening_line2 = ''
-        ch.link_url = ''
-        ch.tts_engine = '구글'
-        ch.tts_speed = tts_speed
-        ch.character = 'random'
-        ch.voice = tts_voice
-        ch.tone = 'FRIEND'
-        ch.token_path = None
-        ch.thumb_line1 = ''
-        ch.thumb_line2 = ''
+        print(f"[INFO] job={job_id} 사진={len(photo_paths)} 음성={duration:.1f}s")
 
-        # ── 대본 생성 ──
-        vg = get_video_generator()
+        # 자막 문장
+        sentences = [s.strip() for s in script.split('\n') if s.strip()] if script else ['']
+        sec_per_sent = duration / max(len(sentences), 1)
+        sec_per_photo = duration / max(len(photo_paths), 1)
 
-        # 대사 소재로 제목 생성
-        seed_block = f"\n【대사 소재】\n{seeds}" if seeds else ""
-        prompt = f"""너는 유튜브 쇼츠 분양 영상 전문 작가다.
-【단지명】 {project_name}{seed_block}
-유튜브 쇼츠 제목 1개만 생성해라. 30자 이내, 번호 없이."""
+        # 각 사진 → 클립
+        clips_dir = os.path.join(job_dir, 'clips')
+        os.makedirs(clips_dir, exist_ok=True)
+        clip_paths = []
 
-        import requests as req_lib
-        gpt_resp = req_lib.post(
-            'https://api.openai.com/v1/chat/completions',
-            headers={'Authorization': f'Bearer {OPENAI_KEY}', 'Content-Type': 'application/json'},
-            json={'model': 'gpt-4o-mini', 'messages': [{'role': 'user', 'content': prompt}], 'max_tokens': 100, 'temperature': 0.9},
-            timeout=30
-        )
-        gpt_resp.raise_for_status()
-        title = gpt_resp.json()['choices'][0]['message']['content'].strip()
+        for i, pp in enumerate(photo_paths):
+            cp = os.path.join(clips_dir, f'c{i:03d}.mp4')
+            frames = max(int(sec_per_photo * 25), 1)
+            cmd = [
+                'ffmpeg', '-y', '-loop', '1', '-i', pp,
+                '-vf', (
+                    f'scale=1080:1920:force_original_aspect_ratio=increase,'
+                    f'crop=1080:1920,'
+                    f'zoompan=z=\'zoom+0.0008\':x=\'iw/2-(iw/zoom/2)\':'
+                    f'y=\'ih/2-(ih/zoom/2)\':d={frames}:s=1080x1920:fps=25'
+                ),
+                '-t', str(sec_per_photo),
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                '-pix_fmt', 'yuv420p', cp
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                # 단순 버전
+                cmd2 = [
+                    'ffmpeg', '-y', '-loop', '1', '-i', pp,
+                    '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
+                    '-t', str(sec_per_photo), '-r', '25',
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                    '-pix_fmt', 'yuv420p', cp
+                ]
+                r2 = subprocess.run(cmd2, capture_output=True, text=True)
+                if r2.returncode != 0:
+                    print(f"[WARN] 클립{i} 실패")
+                    continue
+            clip_paths.append(cp)
 
-        ch.titles = [title]
-        ch.current_title_index = 0
+        if not clip_paths:
+            return jsonify({'success': False, 'error': '클립 생성 실패'}), 500
 
-        # 대사 소재 파일 저장
-        if seeds:
-            seed_path = os.path.join(
-                os.path.dirname(__file__), 'channels',
-                f'{job_id}_script_seeds.txt'
-            )
-            os.makedirs(os.path.dirname(seed_path), exist_ok=True)
-            with open(seed_path, 'w', encoding='utf-8') as f:
-                for line in seeds.splitlines():
-                    if line.strip():
-                        f.write(f'[대사] {line.strip()}\n')
+        # 클립 합치기
+        concat_txt = os.path.join(job_dir, 'list.txt')
+        with open(concat_txt, 'w') as f:
+            for cp in clip_paths:
+                f.write(f"file '{cp}'\n")
+        concat_mp4 = os.path.join(job_dir, 'concat.mp4')
+        subprocess.run(['ffmpeg','-y','-f','concat','-safe','0','-i',concat_txt,
+                        '-c','copy', concat_mp4], capture_output=True)
 
-        # ── 영상 생성 ──
-        vg._current_mode = 'photos'
-        output_path = vg.create_video(ch, 0, 'photos', upload=False)
+        # 자막+문의박스+음성 합성
+        font = find_font()
+        vf_parts = []
 
-        if not output_path or not os.path.exists(output_path):
-            return jsonify({'success': False, 'error': '영상 생성 실패'}), 500
+        if font and sentences:
+            for i, s in enumerate(sentences):
+                if not s: continue
+                t0 = i * sec_per_sent
+                t1 = t0 + sec_per_sent
+                safe = s.replace("'","\\'").replace(':','\\:').replace(',','\\,')
+                vf_parts.append(
+                    f"drawtext=fontfile='{font}':text='{safe}':fontsize={sub_size}"
+                    f":fontcolor=white:borderw=4:bordercolor=black"
+                    f":x=(w-text_w)/2:y=h*0.69:enable='between(t,{t0:.2f},{t1:.2f})'"
+                )
 
-        # 결과 파일 복사
-        result_path = os.path.join(job_dir, f'{project_name}_쇼츠.mp4')
-        shutil.copy2(output_path, result_path)
+        if font:
+            p = inq_pos / 100
+            for text, sz, offset, color in [
+                (inq_title, inq_size1, 10, 'white'),
+                (inq_time,  inq_size2, inq_size1+25, '#64E8F0'),
+                (inq_phone, inq_size2, inq_size1+inq_size2+45, '#64E8F0'),
+            ]:
+                safe = text.replace("'","\\'").replace(':','\\:').replace(',','\\,')
+                vf_parts.append(
+                    f"drawtext=fontfile='{font}':text='{safe}':fontsize={sz}"
+                    f":fontcolor={color}:borderw=5:bordercolor=black"
+                    f":x=(w-text_w)/2:y=h*{p:.3f}+{offset}"
+                )
 
-        return send_file(
-            result_path,
-            mimetype='video/mp4',
-            as_attachment=True,
-            download_name=f'{project_name}_쇼츠.mp4'
-        )
+        vf = ','.join(vf_parts) if vf_parts else 'null'
+        output = os.path.join(job_dir, f'{project_name}_쇼츠.mp4')
+
+        cmd_final = [
+            'ffmpeg', '-y',
+            '-i', concat_mp4, '-i', audio_path,
+            '-vf', vf,
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-shortest', '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+            output
+        ]
+        r = subprocess.run(cmd_final, capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"[WARN] vf 실패, 단순 합성 재시도: {r.stderr[-300:]}")
+            cmd_plain = [
+                'ffmpeg', '-y',
+                '-i', concat_mp4, '-i', audio_path,
+                '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-shortest', '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+                output
+            ]
+            r2 = subprocess.run(cmd_plain, capture_output=True, text=True)
+            if r2.returncode != 0:
+                return jsonify({'success': False, 'error': r2.stderr[-300:]}), 500
+
+        size = os.path.getsize(output) if os.path.exists(output) else 0
+        print(f"[INFO] 완료 {size/1024/1024:.1f}MB")
+
+        return send_file(output, mimetype='video/mp4', as_attachment=True,
+                         download_name=f'{project_name}_쇼츠.mp4')
 
     except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[ERROR] {e}\n{tb}")
-        return jsonify({'success': False, 'error': str(e), 'traceback': tb}), 500
-
+        print(f"[ERROR] {traceback.format_exc()}")
+        return jsonify({'success': False, 'error': str(e)}), 500
     finally:
-        # 임시 파일 정리 (5분 후)
         import threading
         def cleanup():
-            import time
-            time.sleep(300)
+            import time; time.sleep(300)
             shutil.rmtree(job_dir, ignore_errors=True)
         threading.Thread(target=cleanup, daemon=True).start()
-
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
