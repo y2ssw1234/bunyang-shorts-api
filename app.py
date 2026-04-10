@@ -10,6 +10,18 @@ import shutil
 import tempfile
 import traceback
 from flask import Flask, request, jsonify, send_file
+import httpx as _httpx
+
+# openai proxies 오류 패치
+try:
+    import openai._base_client as _obc
+    _orig_init = _obc.SyncAPIClient.__init__
+    def _patched_init(self, *args, **kwargs):
+        kwargs.pop('proxies', None)
+        _orig_init(self, *args, **kwargs)
+    _obc.SyncAPIClient.__init__ = _patched_init
+except Exception:
+    pass
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -127,8 +139,8 @@ def generate():
 【단지명】 {project_name}{seed_block}
 유튜브 쇼츠 제목 1개만 생성해라. 30자 이내, 번호 없이."""
 
-        import openai
-        client = openai.OpenAI(api_key=OPENAI_KEY)
+        import openai, httpx
+        client = openai.OpenAI(api_key=OPENAI_KEY, http_client=httpx.Client())
         resp = client.chat.completions.create(
             model='gpt-4o-mini',
             messages=[{'role': 'user', 'content': prompt}],
