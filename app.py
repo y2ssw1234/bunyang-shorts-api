@@ -43,7 +43,15 @@ def get_video_generator():
         'openai_api_key': OPENAI_KEY,
         'google_credentials': None,
     }
-    return VideoGenerator(config=config)
+    vg = VideoGenerator(config=config)
+    # 환경변수 키 강제 주입
+    vg.openai_key = OPENAI_KEY
+    try:
+        import openai
+        vg.client = openai.OpenAI(api_key=OPENAI_KEY)
+    except Exception as e:
+        print(f"[WARN] OpenAI client 재설정 실패: {e}")
+    return vg
 
 @app.route('/health', methods=['GET'])
 def health():
