@@ -31,9 +31,10 @@ CORS(app)
 WORK_DIR = '/tmp/shorts_work'
 os.makedirs(WORK_DIR, exist_ok=True)
 
-# ── API 키 (환경변수로 관리) ──
-OPENAI_KEY = os.environ.get('OPENAI_API_KEY', '')
-GOOGLE_TTS_KEY = os.environ.get('GOOGLE_TTS_KEY', '')
+# ── API 키 ──
+OPENAI_KEY = os.environ.get('OPENAI_API_KEY', '').strip()
+GOOGLE_TTS_KEY = os.environ.get('GOOGLE_TTS_KEY', '').strip()
+print(f"[INFO] OpenAI Key 길이: {len(OPENAI_KEY)}, 앞4자: {OPENAI_KEY[:4] if OPENAI_KEY else 'EMPTY'}")
 
 def get_video_generator():
     """VideoGenerator 인스턴스 생성"""
@@ -147,15 +148,15 @@ def generate():
 【단지명】 {project_name}{seed_block}
 유튜브 쇼츠 제목 1개만 생성해라. 30자 이내, 번호 없이."""
 
-        import openai, httpx
-        client = openai.OpenAI(api_key=OPENAI_KEY, http_client=httpx.Client())
-        resp = client.chat.completions.create(
-            model='gpt-4o-mini',
-            messages=[{'role': 'user', 'content': prompt}],
-            max_tokens=100,
-            temperature=0.9
+        import requests as req_lib
+        gpt_resp = req_lib.post(
+            'https://api.openai.com/v1/chat/completions',
+            headers={'Authorization': f'Bearer {OPENAI_KEY}', 'Content-Type': 'application/json'},
+            json={'model': 'gpt-4o-mini', 'messages': [{'role': 'user', 'content': prompt}], 'max_tokens': 100, 'temperature': 0.9},
+            timeout=30
         )
-        title = resp.choices[0].message.content.strip()
+        gpt_resp.raise_for_status()
+        title = gpt_resp.json()['choices'][0]['message']['content'].strip()
 
         ch.titles = [title]
         ch.current_title_index = 0
