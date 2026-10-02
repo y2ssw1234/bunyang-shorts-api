@@ -1,0 +1,18 @@
+{
+  "name": "bunyang-shorts-api",
+  "version": "1.0.0",
+  "description": "분양쇼츠 API - 사진 + 대본 + 음성으로 MP4 쇼츠 생성",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "multer": "^2.0.2"
+  }
+}

@@ -1,23 +1,19 @@
-FROM python:3.11-slim
+FROM node:22-slim
 
 RUN apt-get update && apt-get install -y \
     ffmpeg \
-    libsm6 \
-    libxext6 \
-    libgl1 \
-    libglib2.0-0 \
     fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
 COPY . .
 
-RUN mkdir -p /tmp/shorts_work outputs channels temp assets/fonts assets/characters
+RUN mkdir -p /tmp/shorts_work
 
 EXPOSE $PORT
 
-CMD gunicorn app:app --bind 0.0.0.0:$PORT --timeout 300 --workers 2
+CMD ["node", "server.js"]
